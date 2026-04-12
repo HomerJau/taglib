@@ -69,6 +69,11 @@ const List<std::pair<unsigned int, offset_t>> &Matroska::SeekHead::entryList() c
   return entries;
 }
 
+Const List<std::pair<unsigned int, offset_t>>& Matroska::SeekHead::entryList() const
+{
+  return entries;
+}
+
 ByteVector Matroska::SeekHead::renderInternal()
 {
   const auto beforeSize = sizeRenderedOrWritten();
