@@ -164,7 +164,7 @@ PropertyMap Matroska::File::setProperties(const PropertyMap &properties)
 
 namespace {
 
-  constexpr offset_t FastScanLimit = static_cast<offset_t>(512 * 1024);
+  constexpr offset_t FastScanLimit = static_cast<offset_t>(1024 * 1024);
 
   struct FastSegmentReadResult
   {
