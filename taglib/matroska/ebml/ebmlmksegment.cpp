@@ -161,7 +161,6 @@ bool EBML::MkSegment::read(File &file)
     else {
       element->skipData(file);
     }
-    i++;
   }
   return true;
 }
