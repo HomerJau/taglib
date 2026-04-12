@@ -727,6 +727,7 @@ void Matroska::File::read(bool readProperties, Properties::ReadStyle readStyle)
   }
 
   // Read the segment into memory from file
+  d->segment = segment->parseSegment();
   if(!segment->read(*this)) {
     debug("Failed to read segment");
     setValid(false);
