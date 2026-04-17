@@ -98,32 +98,27 @@ void EBML::MasterElement::setMinRenderSize(offset_t minimumSize)
   minRenderSize = minimumSize;
 }
 
-bool EBML::MasterElement::read(File &file, int depth)
+bool EBML::MasterElement::read(File& file, int depth)
 {
   static constexpr int MAX_EBML_DEPTH = 64;
-  if(depth > MAX_EBML_DEPTH) {
+  if (depth > MAX_EBML_DEPTH) {
     debug("EBML: Maximum nesting depth exceeded");
     return false;
   }
   const offset_t maxOffset = file.tell() + dataSize;
   std::unique_ptr<Element> element;
-  while((element = findNextElement(file, maxOffset))) {
-    if(auto master = dynamic_cast<MasterElement *>(element.get())) {
-      if(!master->read(file, depth + 1))
+  while ((element = findNextElement(file, maxOffset))) {
+    if (auto master = dynamic_cast<MasterElement*>(element.get())) {
+      if (!master->read(file, depth + 1))
         return false;
     }
     else {
-      if(!element->read(file))
+      if (!element->read(file))
         return false;
     }
     elements.push_back(std::move(element));
   }
-  // Allow the read to succeed even if not all data was consumed.
-  // Some Matroska files have padding or unknown elements that cause
-  // the file position to not exactly match maxOffset.
-  if(file.tell() != maxOffset)
-    file.seek(maxOffset);
-  return true;
+  return file.tell() == maxOffset;
 }
 
 bool EBML::MasterElement::read(File &file)

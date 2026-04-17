@@ -148,25 +148,29 @@ bool EBML::MkSegment::readLimited(File &file, offset_t scanLimit)
       file.seek(filePos);
       while((element = findNextElement(file, fallbackMaxOffset))) {
         const Id eid = element->getId();
+        const offset_t elementEndOffset = file.tell() + element->getDataSize();
         if(!chapters && eid == Id::MkChapters) {
           chapters = element_cast<Id::MkChapters>(std::move(element));
-          if(!chapters->read(file))
-            return false;
+          if(!chapters->read(file)) {
+            // Partial read is OK for chapters in older files with padding/unknown elements.
+            // Seek past the element and keep whatever was successfully parsed.
+            file.seek(elementEndOffset);
+          }
         }
         else if(!tags && eid == Id::MkTags) {
           tags = element_cast<Id::MkTags>(std::move(element));
           if(!tags->read(file))
-            return false;
+            file.seek(elementEndOffset);
         }
         else if(!info && eid == Id::MkInfo) {
           info = element_cast<Id::MkInfo>(std::move(element));
           if(!info->read(file))
-            return false;
+            file.seek(elementEndOffset);
         }
         else if(!attachments && eid == Id::MkAttachments) {
           attachments = element_cast<Id::MkAttachments>(std::move(element));
           if(!attachments->read(file))
-            return false;
+            file.seek(elementEndOffset);
         }
         else {
           element->skipData(file);
