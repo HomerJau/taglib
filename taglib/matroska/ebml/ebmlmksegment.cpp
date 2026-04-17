@@ -138,7 +138,11 @@ bool EBML::MkSegment::readLimited(File &file, offset_t scanLimit)
         }
       }
       // If all essential elements were found via the SeekHead, we're done.
+      // For write access (save path), tags and info are sufficient — skip the
+      // expensive fallback scan since chapters aren't needed for saving tags.
       if(chapters && tags && info)
+        return true;
+      if(tags && info && !file.readOnly())
         return true;
       // Some older MKV files don't index all elements in the SeekHead (e.g. Chapters).
       // Do a targeted scan with a larger limit to find missing elements without
