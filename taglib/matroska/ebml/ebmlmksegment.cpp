@@ -32,30 +32,29 @@ using namespace TagLib;
 
 namespace {
 
-  template <EBML::Element::Id Id, typename ElementType>
-  std::unique_ptr<ElementType> readElementAt(File& file,
-    offset_t offset,
-    offset_t maxOffset)
-  {
-    if (offset < 0 || offset >= maxOffset) {
-      return nullptr;
-    }
-
-    file.seek(offset);
-    auto element = EBML::Element::factory(file);
-    if (!element || element->getId() != Id) {
-      return nullptr;
-    }
-
-    auto typed = EBML::element_cast<Id>(std::move(element));
-    if (!typed || !typed->read(file)) {
-      return nullptr;
-    }
-    return typed;
+template <EBML::Element::Id Id, typename ElementType>
+std::unique_ptr<ElementType> readElementAt(File &file,
+                                           offset_t offset,
+                                           offset_t maxOffset)
+{
+  if(offset < 0 || offset >= maxOffset) {
+    return nullptr;
   }
 
-} // namespace
+  file.seek(offset);
+  auto element = EBML::Element::factory(file);
+  if(!element || element->getId() != Id) {
+    return nullptr;
+  }
 
+  auto typed = EBML::element_cast<Id>(std::move(element));
+  if(!typed || !typed->read(file)) {
+    return nullptr;
+  }
+  return typed;
+}
+
+} // namespace
 
 EBML::MkSegment::MkSegment(int sizeLength, offset_t dataSize, offset_t offset):
   MasterElement(Id::MkSegment, sizeLength, dataSize, offset)
@@ -76,49 +75,61 @@ offset_t EBML::MkSegment::segmentDataOffset() const
 
 bool EBML::MkSegment::read(File &file)
 {
-  const offset_t maxOffset = file.tell() + dataSize;
+  return readLimited(file, dataSize);
+}
+
+bool EBML::MkSegment::readLimited(File &file, offset_t scanLimit)
+{
+  const offset_t filePos = file.tell();
+  const offset_t maxOffset = filePos + dataSize;
+  const offset_t maxScanOffset = filePos + std::min(scanLimit, dataSize);
+  const bool isFastScan = scanLimit < dataSize;
   std::unique_ptr<Element> element;
-  while((element = findNextElement(file, maxOffset))) {
+  while((element = findNextElement(file, maxScanOffset))) {
     if(const Id id = element->getId(); id == Id::MkSeekHead) {
       seekHead = element_cast<Id::MkSeekHead>(std::move(element));
       if(!seekHead->read(file))
         return false;
       // We have a seek head, let's use it for faster access to the other elements
-      auto elementAfterSeekHead = findNextElement(file, maxOffset);
-      if (elementAfterSeekHead->getId() == Id::VoidElement)
+      if(const auto elementAfterSeekHead = findNextElement(file, maxScanOffset);
+         elementAfterSeekHead && elementAfterSeekHead->getId() == Id::VoidElement)
         seekHead->setPadding(elementAfterSeekHead->getSize());
-      auto matroskaSeekHead = parseSeekHead();
-      for (const auto& [idValue, relativeOffset] : matroskaSeekHead->entryList()) {
-        const auto id = static_cast<Id>(idValue);
-        const offset_t absoluteOffset = segmentDataOffset() + relativeOffset;
-        switch (id) {
+      const offset_t segDataOffset = segmentDataOffset();
+      const auto matroskaSeekHead = parseSeekHead();
+      for(const auto &[idValue, relativeOffset] : matroskaSeekHead->entryList()) {
+        const offset_t absoluteOffset = segDataOffset + relativeOffset;
+        switch(static_cast<Id>(idValue)) {
         case Id::MkCues:
-          if (!((cues = readElementAt<Id::MkCues, MkCues>(
-            file, absoluteOffset, maxOffset))))
-            return false;
+          // Skip Cues in fast scan mode — they are only needed for Accurate validation
+          // and can be tens of MB on large files, causing severe network slowdowns
+          if(!isFastScan) {
+            if(!((cues = readElementAt<Id::MkCues, MkCues>(
+              file, absoluteOffset, maxOffset))))
+              return false;
+          }
           break;
         case Id::MkInfo:
-          if (!((info = readElementAt<Id::MkInfo, MkInfo>(
+          if(!((info = readElementAt<Id::MkInfo, MkInfo>(
             file, absoluteOffset, maxOffset))))
             return false;
           break;
         case Id::MkTracks:
-          if (!((tracks = readElementAt<Id::MkTracks, MkTracks>(
+          if(!((tracks = readElementAt<Id::MkTracks, MkTracks>(
             file, absoluteOffset, maxOffset))))
             return false;
           break;
         case Id::MkTags:
-          if (!((tags = readElementAt<Id::MkTags, MkTags>(
+          if(!((tags = readElementAt<Id::MkTags, MkTags>(
             file, absoluteOffset, maxOffset))))
             return false;
           break;
         case Id::MkAttachments:
-          if (!((attachments = readElementAt<Id::MkAttachments, MkAttachments>(
+          if(!((attachments = readElementAt<Id::MkAttachments, MkAttachments>(
             file, absoluteOffset, maxOffset))))
             return false;
           break;
         case Id::MkChapters:
-          if (!((chapters = readElementAt<Id::MkChapters, MkChapters>(
+          if(!((chapters = readElementAt<Id::MkChapters, MkChapters>(
             file, absoluteOffset, maxOffset))))
             return false;
           break;
@@ -126,12 +137,56 @@ bool EBML::MkSegment::read(File &file)
           break;
         }
       }
+      // If all essential elements were found via the SeekHead, we're done.
+      if(chapters && tags && info)
+        return true;
+      // Some older MKV files don't index all elements in the SeekHead (e.g. Chapters).
+      // Do a targeted scan with a larger limit to find missing elements without
+      // reading the entire file (which would be extremely slow over network drives).
+      static constexpr offset_t FALLBACK_SCAN_LIMIT = 10 * 1024 * 1024; // 10 MiB
+      const offset_t fallbackMaxOffset = std::min(filePos + FALLBACK_SCAN_LIMIT, maxOffset);
+      file.seek(filePos);
+      while((element = findNextElement(file, fallbackMaxOffset))) {
+        const Id eid = element->getId();
+        if(!chapters && eid == Id::MkChapters) {
+          chapters = element_cast<Id::MkChapters>(std::move(element));
+          if(!chapters->read(file))
+            return false;
+        }
+        else if(!tags && eid == Id::MkTags) {
+          tags = element_cast<Id::MkTags>(std::move(element));
+          if(!tags->read(file))
+            return false;
+        }
+        else if(!info && eid == Id::MkInfo) {
+          info = element_cast<Id::MkInfo>(std::move(element));
+          if(!info->read(file))
+            return false;
+        }
+        else if(!attachments && eid == Id::MkAttachments) {
+          attachments = element_cast<Id::MkAttachments>(std::move(element));
+          if(!attachments->read(file))
+            return false;
+        }
+        else {
+          element->skipData(file);
+        }
+        // Stop early if we found everything
+        if(chapters && tags && info)
+          return true;
+      }
       return true;
     }
     else if(id == Id::MkCues) {
-      cues = element_cast<Id::MkCues>(std::move(element));
-      if(!cues->read(file))
-        return false;
+      // Skip Cues in fast scan mode
+      if(isFastScan) {
+        element->skipData(file);
+      }
+      else {
+        cues = element_cast<Id::MkCues>(std::move(element));
+        if(!cues->read(file))
+          return false;
+      }
     }
     else if(id == Id::MkInfo) {
       info = element_cast<Id::MkInfo>(std::move(element));

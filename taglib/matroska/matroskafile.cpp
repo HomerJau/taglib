@@ -31,14 +31,9 @@
 #include "matroskasegment.h"
 #include "ebmlutils.h"
 #include "ebmlelement.h"
-#include "ebmlmasterelement.h"
 #include "ebmlstringelement.h"
 #include "ebmluintelement.h"
-#include "ebmlmkinfo.h"
-#include "ebmlmkseekhead.h"
 #include "ebmlmksegment.h"
-#include "ebmlmktags.h"
-#include "ebmlmktracks.h"
 #include "tlist.h"
 #include "tdebug.h"
 #include "tagutils.h"
@@ -62,8 +57,6 @@ public:
   std::unique_ptr<Cues> cues;
   std::unique_ptr<Segment> segment;
   std::unique_ptr<Properties> properties;
-  bool partialRead = false;
-  bool tagStateResolved = true;
 };
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -120,10 +113,6 @@ Tag *Matroska::File::tag() const
 
 Matroska::Tag *Matroska::File::tag(bool create) const
 {
-  if(!ensureTagResolved()) {
-    return nullptr;
-  }
-
   if(!d->tag && create) {
     d->tag = std::make_unique<Tag>();
     if(d->properties) {
@@ -135,17 +124,11 @@ Matroska::Tag *Matroska::File::tag(bool create) const
 
 PropertyMap Matroska::File::properties() const
 {
-  if(!ensureTagResolved()) {
-    return PropertyMap();
-  }
   return d->tag ? d->tag->properties() : PropertyMap();
 }
 
 void Matroska::File::removeUnsupportedProperties(const StringList &properties)
 {
-  if(!ensureTagResolved()) {
-    return;
-  }
   if(d->tag) {
     d->tag->removeUnsupportedProperties(properties);
   }
@@ -153,9 +136,6 @@ void Matroska::File::removeUnsupportedProperties(const StringList &properties)
 
 PropertyMap Matroska::File::setProperties(const PropertyMap &properties)
 {
-  if(!ensureTagResolved()) {
-    return properties;
-  }
   if(!d->tag) {
     d->tag = std::make_unique<Tag>();
   }
@@ -164,13 +144,7 @@ PropertyMap Matroska::File::setProperties(const PropertyMap &properties)
 
 namespace {
 
-  constexpr offset_t FastScanLimit = static_cast<offset_t>(1024 * 1024);
-
-  struct FastSegmentReadResult
-  {
-    bool success = false;
-    bool tagStateResolved = false;
-  };
+  constexpr offset_t FAST_SCAN_LIMIT = static_cast<offset_t>(2 * 1024 * 1024);
 
   String keyForAttachedFile(const Matroska::AttachedFile &attachedFile)
   {
@@ -196,179 +170,10 @@ namespace {
     );
   }
 
-  template <EBML::Element::Id Id, typename ElementType>
-  std::unique_ptr<ElementType> readElementAt(Matroska::File &file,
-                                             offset_t offset,
-                                             offset_t maxOffset)
-  {
-    if(offset < 0 || offset >= maxOffset) {
-      return nullptr;
-    }
-
-    file.seek(offset);
-    auto element = EBML::Element::factory(file);
-    if(!element || element->getId() != Id) {
-      return nullptr;
-    }
-
-    auto typed = EBML::element_cast<Id>(std::move(element));
-    if(!typed || !typed->read(file)) {
-      return nullptr;
-    }
-    return typed;
-  }
-
-  FastSegmentReadResult readFastSegmentData(Matroska::File &file,
-                                            const EBML::MkSegment &segment,
-                                            bool readProperties,
-                                            std::unique_ptr<Matroska::SeekHead> &seekHead,
-                                            std::unique_ptr<Matroska::Tag> &tag,
-                                            std::unique_ptr<Matroska::Properties> &properties)
-  {
-    const offset_t fileLength = file.length();
-    const offset_t segmentDataOffset = segment.segmentDataOffset();
-    if(segmentDataOffset < 0 || segmentDataOffset >= fileLength) {
-      return {};
-    }
-
-    bool haveInfo = !readProperties;
-    bool haveTracks = !readProperties;
-    bool tagStateResolved = tag != nullptr;
-    offset_t scanLimit = segmentDataOffset + FastScanLimit;
-    if(scanLimit > fileLength) {
-      scanLimit = fileLength;
-    }
-
-    file.seek(segmentDataOffset);
-    while(file.tell() < scanLimit) {
-      auto element = EBML::Element::factory(file);
-      if(!element) {
-        break;
-      }
-
-      switch(element->getId()) {
-      case EBML::Element::Id::MkSeekHead: {
-        auto mkSeekHead = EBML::element_cast<EBML::Element::Id::MkSeekHead>(std::move(element));
-        if(!mkSeekHead || !mkSeekHead->read(file)) {
-          return {};
-        }
-        seekHead = mkSeekHead->parse(segmentDataOffset);
-        break;
-      }
-      case EBML::Element::Id::MkInfo:
-        if(readProperties && properties && !haveInfo) {
-          auto mkInfo = EBML::element_cast<EBML::Element::Id::MkInfo>(std::move(element));
-          if(!mkInfo || !mkInfo->read(file)) {
-            return {};
-          }
-          mkInfo->parse(properties.get());
-          haveInfo = true;
-        }
-        else {
-          element->skipData(file);
-        }
-        break;
-      case EBML::Element::Id::MkTracks:
-        if(readProperties && properties && !haveTracks) {
-          auto mkTracks = EBML::element_cast<EBML::Element::Id::MkTracks>(std::move(element));
-          if(!mkTracks || !mkTracks->read(file)) {
-            return {};
-          }
-          mkTracks->parse(properties.get());
-          haveTracks = true;
-        }
-        else {
-          element->skipData(file);
-        }
-        break;
-      case EBML::Element::Id::MkTags:
-        if(!tag) {
-          auto mkTags = EBML::element_cast<EBML::Element::Id::MkTags>(std::move(element));
-          if(!mkTags || !mkTags->read(file)) {
-            return {};
-          }
-          tag = mkTags->parse();
-          tagStateResolved = true;
-        }
-        else {
-          element->skipData(file);
-        }
-        break;
-      default:
-        element->skipData(file);
-        break;
-      }
-
-      if(haveInfo && haveTracks && tagStateResolved) {
-        return {true, true};
-      }
-    }
-
-    bool hasTagsEntry = false;
-    if(seekHead) {
-      for(const auto &[idValue, relativeOffset] : seekHead->entryList()) {
-        const auto id = static_cast<EBML::Element::Id>(idValue);
-        const offset_t absoluteOffset = segmentDataOffset + relativeOffset;
-        switch(id) {
-        case EBML::Element::Id::MkInfo:
-          if(readProperties && properties && !haveInfo) {
-            auto mkInfo = readElementAt<EBML::Element::Id::MkInfo, EBML::MkInfo>(
-              file, absoluteOffset, fileLength);
-            if(!mkInfo) {
-              return {};
-            }
-            mkInfo->parse(properties.get());
-            haveInfo = true;
-          }
-          break;
-        case EBML::Element::Id::MkTracks:
-          if(readProperties && properties && !haveTracks) {
-            auto mkTracks = readElementAt<EBML::Element::Id::MkTracks, EBML::MkTracks>(
-              file, absoluteOffset, fileLength);
-            if(!mkTracks) {
-              return {};
-            }
-            mkTracks->parse(properties.get());
-            haveTracks = true;
-          }
-          break;
-        case EBML::Element::Id::MkTags:
-          hasTagsEntry = true;
-          if(!tag) {
-            auto mkTags = readElementAt<EBML::Element::Id::MkTags, EBML::MkTags>(
-              file, absoluteOffset, fileLength);
-            if(!mkTags) {
-              return {};
-            }
-            tag = mkTags->parse();
-          }
-          tagStateResolved = true;
-          break;
-        default:
-          break;
-        }
-
-        if(haveInfo && haveTracks && tagStateResolved) {
-          return {true, true};
-        }
-      }
-    }
-
-    if(seekHead && !hasTagsEntry && !tag) {
-      tagStateResolved = true;
-    }
-
-    return {haveInfo && haveTracks, tagStateResolved};
-  }
-
 }
 
 StringList Matroska::File::complexPropertyKeys() const
 {
-  if(d->partialRead && !ensureFullyParsed()) {
-    return TagLib::File::complexPropertyKeys();
-  }
-
   StringList keys = TagLib::File::complexPropertyKeys();
   if(d->attachments) {
     const auto &attachedFiles = d->attachments->attachedFileList();
@@ -388,10 +193,6 @@ StringList Matroska::File::complexPropertyKeys() const
 List<VariantMap> Matroska::File::complexProperties(const String &key) const
 {
   List<VariantMap> props = TagLib::File::complexProperties(key);
-  if(d->partialRead && !ensureFullyParsed()) {
-    return props;
-  }
-
   if(key.upper() == "CHAPTERS") {
     if(d->chapters) {
       for(const auto &edition : d->chapters->chapterEditionList()) {
@@ -460,10 +261,6 @@ List<VariantMap> Matroska::File::complexProperties(const String &key) const
 
 bool Matroska::File::setComplexProperties(const String &key, const List<VariantMap> &value)
 {
-  if(d->partialRead && !ensureFullyParsed()) {
-    return false;
-  }
-
   if(TagLib::File::setComplexProperties(key, value)) {
     return true;
   }
@@ -550,9 +347,6 @@ bool Matroska::File::setComplexProperties(const String &key, const List<VariantM
 
 Matroska::Attachments *Matroska::File::attachments(bool create) const
 {
-  if(d->partialRead && !ensureFullyParsed()) {
-    return nullptr;
-  }
   if(!d->attachments && create)
     d->attachments = std::make_unique<Attachments>();
   return d->attachments.get();
@@ -560,82 +354,9 @@ Matroska::Attachments *Matroska::File::attachments(bool create) const
 
 Matroska::Chapters *Matroska::File::chapters(bool create) const
 {
-  if(d->partialRead && !ensureFullyParsed()) {
-    return nullptr;
-  }
   if(!d->chapters && create)
     d->chapters = std::make_unique<Chapters>();
   return d->chapters.get();
-}
-
-bool Matroska::File::ensureFullyParsed() const
-{
-  if(!d->partialRead) {
-    return true;
-  }
-
-  auto &file = *const_cast<Matroska::File *>(this);
-  const offset_t fileLength = file.length();
-  file.seek(0);
-
-  const auto head = EBML::element_cast<EBML::Element::Id::EBMLHeader>(
-    EBML::Element::factory(file));
-  if(!head || head->getId() != EBML::Element::Id::EBMLHeader) {
-    debug("Failed to find EBML head");
-    file.setValid(false);
-    return false;
-  }
-  head->skipData(file);
-
-  const std::unique_ptr<EBML::MkSegment> segment(
-    EBML::element_cast<EBML::Element::Id::MkSegment>(
-      EBML::findElement(file, EBML::Element::Id::MkSegment, fileLength - file.tell())
-    )
-  );
-  if(!segment) {
-    debug("Failed to find Matroska segment");
-    file.setValid(false);
-    return false;
-  }
-
-  if(!segment->read(file)) {
-    debug("Failed to read segment");
-    file.setValid(false);
-    return false;
-  }
-
-  auto existingTag = std::move(d->tag);
-
-  d->segment = segment->parseSegment();
-  d->seekHead = segment->parseSeekHead();
-  d->cues = segment->parseCues();
-  d->attachments = segment->parseAttachments();
-  d->chapters = segment->parseChapters();
-
-  if(existingTag) {
-    if(d->properties) {
-      existingTag->setSegmentTitle(d->properties->title());
-    }
-    d->tag = std::move(existingTag);
-  }
-  else {
-    d->tag = segment->parseTag();
-    if(d->tag && d->properties) {
-      d->tag->setSegmentTitle(d->properties->title());
-    }
-  }
-
-  d->partialRead = false;
-  d->tagStateResolved = true;
-  return true;
-}
-
-bool Matroska::File::ensureTagResolved() const
-{
-  if(d->tagStateResolved) {
-    return true;
-  }
-  return ensureFullyParsed();
 }
 
 void Matroska::File::read(bool readProperties, Properties::ReadStyle readStyle)
@@ -657,10 +378,15 @@ void Matroska::File::read(bool readProperties, Properties::ReadStyle readStyle)
     head->skipData(*this);
   }
 
+  offset_t maxOffset = fileLength - tell();
+  if (readStyle == Properties::ReadStyle::Fast && maxOffset > FAST_SCAN_LIMIT) {
+    maxOffset = FAST_SCAN_LIMIT;
+  }
+
   // Find the Matroska segment in the file
   const std::unique_ptr<EBML::MkSegment> segment(
     EBML::element_cast<EBML::Element::Id::MkSegment>(
-      EBML::findElement(*this, EBML::Element::Id::MkSegment, fileLength - tell())
+      EBML::findElement(*this, EBML::Element::Id::MkSegment, maxOffset)
     )
   );
   if(!segment) {
@@ -669,7 +395,24 @@ void Matroska::File::read(bool readProperties, Properties::ReadStyle readStyle)
     return;
   }
 
+  // Read the segment into memory from file
   d->segment = segment->parseSegment();
+  maxOffset = segment->getDataSize();
+  if (readStyle == Properties::ReadStyle::Fast && maxOffset > FAST_SCAN_LIMIT) {
+    maxOffset = FAST_SCAN_LIMIT;
+  }
+  if(!segment->readLimited(*this, maxOffset)) {
+    debug("Failed to read segment");
+    setValid(false);
+    return;
+  }
+
+  // Parse the elements
+  d->seekHead = segment->parseSeekHead();
+  d->cues = segment->parseCues();
+  d->tag = segment->parseTag();
+  d->attachments = segment->parseAttachments();
+  d->chapters = segment->parseChapters();
 
   if(readProperties) {
     d->properties = std::make_unique<Properties>(this);
@@ -684,67 +427,7 @@ void Matroska::File::read(bool readProperties, Properties::ReadStyle readStyle)
           EBML::element_cast<EBML::Element::Id::DocTypeVersion>(element)->getValue()));
       }
     }
-  }
 
-  if(readStyle == AudioProperties::ReadStyle::Fast) {
-    const auto fastRead = readFastSegmentData(*this, *segment, readProperties,
-                                              d->seekHead, d->tag, d->properties);
-    if(fastRead.success) {
-      if(d->tag && d->properties) {
-        d->tag->setSegmentTitle(d->properties->title());
-      }
-      d->partialRead = true;
-      d->tagStateResolved = fastRead.tagStateResolved;
-      setValid(true);
-      return;
-    }
-
-    d->seekHead.reset();
-    d->cues.reset();
-    d->tag.reset();
-    d->attachments.reset();
-    d->chapters.reset();
-    d->partialRead = false;
-    d->tagStateResolved = true;
-    if(readProperties) {
-      d->properties = std::make_unique<Properties>(this);
-      for(const auto &element : *head) {
-        if(const auto id = element->getId(); id == EBML::Element::Id::DocType) {
-          d->properties->setDocType(
-            EBML::element_cast<EBML::Element::Id::DocType>(element)->getValue());
-        }
-        else if(id == EBML::Element::Id::DocTypeVersion) {
-          d->properties->setDocTypeVersion(static_cast<int>(
-            EBML::element_cast<EBML::Element::Id::DocTypeVersion>(element)->getValue()));
-        }
-      }
-    }
-    else {
-      d->properties.reset();
-    }
-
-    seek(segment->segmentDataOffset());
-  }
-
-  // Read the segment into memory from file
-  d->segment = segment->parseSegment();
-  if(!segment->read(*this)) {
-    debug("Failed to read segment");
-    setValid(false);
-    return;
-  }
-
-  // Parse the elements
-  d->segment = segment->parseSegment();
-  d->seekHead = segment->parseSeekHead();
-  d->cues = segment->parseCues();
-  d->tag = segment->parseTag();
-  d->attachments = segment->parseAttachments();
-  d->chapters = segment->parseChapters();
-  d->partialRead = false;
-  d->tagStateResolved = true;
-
-  if(readProperties) {
     segment->parseInfo(d->properties.get());
     segment->parseTracks(d->properties.get());
     if(d->tag) {
@@ -763,9 +446,6 @@ void Matroska::File::read(bool readProperties, Properties::ReadStyle readStyle)
 
 bool Matroska::File::save()
 {
-  if(d->partialRead && !ensureFullyParsed()) {
-    return false;
-  }
   if(readOnly()) {
     debug("Matroska::File::save() -- File is read only.");
     return false;

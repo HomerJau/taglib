@@ -54,7 +54,6 @@ bool Matroska::SeekHead::isValid(TagLib::File &file) const
 void Matroska::SeekHead::addEntry(const Element &element)
 {
   entries.append({element.id(), element.offset()});
-  debug("adding to seekhead");
   setNeedsRender(true);
 }
 

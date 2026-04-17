@@ -109,6 +109,57 @@ std::unique_ptr<Matroska::Chapters> EBML::MkChapters::parse() const
       chapters->addChapterEdition(Matroska::ChapterEdition(
         editionChapters, editionIsDefault, editionIsOrdered, editionUid));
     }
+  } // <-- END of the EditionEntry loop
+
+  // Collect orphan ChapterAtom elements directly under Chapters (no EditionEntry parent).
+  // Some old Matroska files store chapters this way. Wrap them in a synthetic
+  // edition with UID 0 so callers can detect and process them.
+  List<Matroska::Chapter> orphanChapters;
+  for(const auto &elem : elements) {
+    if(elem->getId() != Id::MkChapterAtom)
+      continue;
+
+    Matroska::Chapter::UID chapterUid = 0;
+    Matroska::Chapter::Time chapterTimeStart = 0;
+    Matroska::Chapter::Time chapterTimeEnd = 0;
+    List<Matroska::Chapter::Display> chapterDisplays;
+    bool chapterHidden = false;
+    const auto chapterAtom = element_cast<Id::MkChapterAtom>(elem);
+    for(const auto &chapterChild : *chapterAtom) {
+      const Id cid = chapterChild->getId();
+      if(cid == Id::MkChapterUID)
+        chapterUid = element_cast<Id::MkChapterUID>(chapterChild)->getValue();
+      else if(cid == Id::MkChapterTimeStart)
+        chapterTimeStart = element_cast<Id::MkChapterTimeStart>(chapterChild)->getValue();
+      else if(cid == Id::MkChapterTimeEnd)
+        chapterTimeEnd = element_cast<Id::MkChapterTimeEnd>(chapterChild)->getValue();
+      else if(cid == Id::MkChapterFlagHidden)
+        chapterHidden = element_cast<Id::MkChapterFlagHidden>(chapterChild)->getValue() != 0;
+      else if(cid == Id::MkChapterDisplay) {
+        const auto display = element_cast<Id::MkChapterDisplay>(chapterChild);
+        String displayString;
+        String displayLanguage;
+        for(const auto &displayChild : *display) {
+          const Id did = displayChild->getId();
+          if(did == Id::MkChapString)
+            displayString = element_cast<Id::MkChapString>(displayChild)->getValue();
+          else if(did == Id::MkChapLanguage)
+            displayLanguage = element_cast<Id::MkChapLanguage>(displayChild)->getValue();
+        }
+        if(!displayString.isEmpty()) {
+          chapterDisplays.append(Matroska::Chapter::Display(displayString, displayLanguage));
+        }
+      }
+    }
+    if(chapterUid) {
+      orphanChapters.append(Matroska::Chapter(
+        chapterTimeStart, chapterTimeEnd, chapterDisplays, chapterUid, chapterHidden));
+    }
   }
+  if(!orphanChapters.isEmpty()) {
+    chapters->addChapterEdition(Matroska::ChapterEdition(
+      orphanChapters, false, false, 0));
+  }
+
   return chapters;
 }

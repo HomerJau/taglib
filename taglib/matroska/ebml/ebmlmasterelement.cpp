@@ -118,7 +118,12 @@ bool EBML::MasterElement::read(File &file, int depth)
     }
     elements.push_back(std::move(element));
   }
-  return file.tell() == maxOffset;
+  // Allow the read to succeed even if not all data was consumed.
+  // Some Matroska files have padding or unknown elements that cause
+  // the file position to not exactly match maxOffset.
+  if(file.tell() != maxOffset)
+    file.seek(maxOffset);
+  return true;
 }
 
 bool EBML::MasterElement::read(File &file)
