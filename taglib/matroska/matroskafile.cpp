@@ -401,7 +401,7 @@ void Matroska::File::read(bool readProperties, Properties::ReadStyle readStyle)
   if (readStyle == Properties::ReadStyle::Fast && maxOffset > FAST_SCAN_LIMIT) {
     maxOffset = FAST_SCAN_LIMIT;
   }
-  if(!segment->readLimited(*this, maxOffset)) {
+  if (!segment->readLimited(*this, maxOffset, readOnly())) {
     debug("Failed to read segment");
     setValid(false);
     return;

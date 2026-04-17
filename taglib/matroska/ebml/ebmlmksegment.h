@@ -51,7 +51,7 @@ namespace TagLib {
 
       offset_t segmentDataOffset() const;
       bool read(File &file) override;
-      bool readLimited(File &file, offset_t scanLimit);
+      bool readLimited(File& file, offset_t scanLimit, bool findChapters = true);
       std::unique_ptr<Matroska::Tag> parseTag() const;
       std::unique_ptr<Matroska::Attachments> parseAttachments() const;
       std::unique_ptr<Matroska::Chapters> parseChapters() const;
