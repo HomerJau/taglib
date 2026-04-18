@@ -280,7 +280,7 @@ void FileStream::insert(const ByteVector &data, offset_t start, size_t replace)
   // the *difference* in the tag sizes.  We want to avoid overwriting parts
   // that aren't yet in memory, so this is necessary.
 
-  size_t bufferLength = bufferSize();
+  size_t bufferLength = 2 * 1024 * 1024; // 2 MiB
 
   while(data.size() - replace > bufferLength)
     bufferLength += bufferSize();
@@ -334,7 +334,7 @@ void FileStream::removeBlock(offset_t start, size_t length)
     return;
   }
 
-  unsigned int bufferLength = bufferSize();
+  unsigned int bufferLength = 2 * 1024 * 1024; // 2 MiB
 
   offset_t readPosition = start + length;
   offset_t writePosition = start;
