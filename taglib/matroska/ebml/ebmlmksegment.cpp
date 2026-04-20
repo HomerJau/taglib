@@ -150,8 +150,9 @@ bool EBML::MkSegment::readLimited(File& file, offset_t scanLimit, bool findChapt
       // reading the entire file (which would be extremely slow over network drives).
       static constexpr offset_t FALLBACK_SCAN_LIMIT = 10 * 1024 * 1024; // 10 MiB
       const offset_t fallbackMaxOffset = std::min(filePos + FALLBACK_SCAN_LIMIT, maxOffset);
+      const offset_t tagsMaxOffset = maxOffset; // Tags are tiny — scan full segment for them
       file.seek(filePos);
-      while((element = findNextElement(file, fallbackMaxOffset))) {
+      while ((element = findNextElement(file, (!tags ? tagsMaxOffset : fallbackMaxOffset)))) {
         const Id eid = element->getId();
         const offset_t elementEndOffset = file.tell() + element->getDataSize();
         if(!chapters && eid == Id::MkChapters) {
