@@ -83,6 +83,8 @@ bool EBML::MkSegment::readLimited(File &file, offset_t scanLimit)
   const offset_t filePos = file.tell();
   const offset_t maxOffset = filePos + dataSize;
   const offset_t maxScanOffset = filePos + std::min(scanLimit, dataSize);
+  MasterElement *pendingPaddingTarget = nullptr;
+  offset_t accumulatedPadding = 0;
   std::unique_ptr<Element> element;
   while((element = findNextElement(file, maxScanOffset))) {
     if(const Id id = element->getId(); id == Id::MkSeekHead) {
@@ -95,9 +97,47 @@ bool EBML::MkSegment::readLimited(File &file, offset_t scanLimit)
         seekHead->setPadding(elementAfterSeekHead->getSize());
       const offset_t segDataOffset = segmentDataOffset();
       const auto matroskaSeekHead = parseSeekHead();
-      for(const auto &[idValue, relativeOffset] : matroskaSeekHead->entryList()) {
+      const auto accumulateVoidPadding = [&](MasterElement *target) {
+        offset_t accPadding = 0;
+        while(const auto next = findNextElement(file, maxOffset)) {
+          if(next->getId() != Id::VoidElement)
+            break;
+          accPadding += next->getSize();
+          next->skipData(file);
+        }
+        if(accPadding > 0)
+          target->setPadding(accPadding);
+      };
+
+      // Build a work list of seek entries.  Some muxers (e.g. MakeMKV,
+      // mkvmerge) write a small primary SeekHead at the start of the segment
+      // that only references a secondary SeekHead at the end of the file,
+      // which in turn lists Info / Tracks / Tags / Chapters / Attachments.
+      // Follow such MkSeekHead -> MkSeekHead chains so the real entries are
+      // not silently dropped.
+      List<std::pair<unsigned int, offset_t>> entries =
+        matroskaSeekHead->entryList();
+      // Guard against pathological / circular chains.
+      int chainedSeekHeadsFollowed = 0;
+      constexpr int MAX_CHAINED_SEEKHEADS = 8;
+
+      for(size_t i = 0; i < entries.size(); ++i) {
+        const auto &[idValue, relativeOffset] = entries[i];
         const offset_t absoluteOffset = segDataOffset + relativeOffset;
         switch(static_cast<Id>(idValue)) {
+        case Id::MkSeekHead: {
+          if(chainedSeekHeadsFollowed++ >= MAX_CHAINED_SEEKHEADS)
+            break;
+          auto chained = readElementAt<Id::MkSeekHead, MkSeekHead>(
+            file, absoluteOffset, maxOffset);
+          if(!chained)
+            break;
+          if(const auto parsed = chained->parse(segDataOffset)) {
+            for(const auto &entry : parsed->entryList())
+              entries.append(entry);
+          }
+          break;
+        }
         case Id::MkCues:
           if(!((cues = readElementAt<Id::MkCues, MkCues>(
             file, absoluteOffset, maxOffset))))
@@ -117,16 +157,19 @@ bool EBML::MkSegment::readLimited(File &file, offset_t scanLimit)
           if(!((tags = readElementAt<Id::MkTags, MkTags>(
             file, absoluteOffset, maxOffset))))
             return false;
+          accumulateVoidPadding(tags.get());
           break;
         case Id::MkAttachments:
           if(!((attachments = readElementAt<Id::MkAttachments, MkAttachments>(
             file, absoluteOffset, maxOffset))))
             return false;
+          accumulateVoidPadding(attachments.get());
           break;
         case Id::MkChapters:
           if(!((chapters = readElementAt<Id::MkChapters, MkChapters>(
             file, absoluteOffset, maxOffset))))
             return false;
+          accumulateVoidPadding(chapters.get());
           break;
         default:
           break;
@@ -134,37 +177,61 @@ bool EBML::MkSegment::readLimited(File &file, offset_t scanLimit)
       }
       return true;
     }
+    else if(id == Id::VoidElement) {
+      if(pendingPaddingTarget) {
+        accumulatedPadding += element->getSize();
+        pendingPaddingTarget->setPadding(accumulatedPadding);
+      }
+      element->skipData(file);
+    }
     else if(id == Id::MkCues) {
+      pendingPaddingTarget = nullptr;
+      accumulatedPadding = 0;
       cues = element_cast<Id::MkCues>(std::move(element));
       if(!cues->read(file))
         return false;
     }
     else if(id == Id::MkInfo) {
+      pendingPaddingTarget = nullptr;
+      accumulatedPadding = 0;
       info = element_cast<Id::MkInfo>(std::move(element));
       if(!info->read(file))
         return false;
     }
     else if(id == Id::MkTracks) {
+      pendingPaddingTarget = nullptr;
+      accumulatedPadding = 0;
       tracks = element_cast<Id::MkTracks>(std::move(element));
       if(!tracks->read(file))
         return false;
     }
     else if(id == Id::MkTags) {
+      pendingPaddingTarget = nullptr;
+      accumulatedPadding = 0;
       tags = element_cast<Id::MkTags>(std::move(element));
       if(!tags->read(file))
         return false;
+      pendingPaddingTarget = tags.get();
     }
     else if(id == Id::MkAttachments) {
+      pendingPaddingTarget = nullptr;
+      accumulatedPadding = 0;
       attachments = element_cast<Id::MkAttachments>(std::move(element));
       if(!attachments->read(file))
         return false;
+      pendingPaddingTarget = attachments.get();
     }
     else if(id == Id::MkChapters) {
+      pendingPaddingTarget = nullptr;
+      accumulatedPadding = 0;
       chapters = element_cast<Id::MkChapters>(std::move(element));
       if(!chapters->read(file))
         return false;
+      pendingPaddingTarget = chapters.get();
     }
     else {
+      pendingPaddingTarget = nullptr;
+      accumulatedPadding = 0;
       element->skipData(file);
     }
   }

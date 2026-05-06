@@ -103,7 +103,13 @@ std::unique_ptr<Matroska::Chapters> EBML::MkChapters::parse() const
 
   for(const auto &element : elements) {
     if(element->getId() == Id::MkChapterAtom) {
-      if(auto chapter = parseChapterAtom(element); chapter.uid()) {
+      // Files containing orphan ChapterAtoms are already non-conforming
+      // (ChapterAtom should be inside an EditionEntry). Such muxers also
+      // commonly omit ChapterUID, so do not require a non-zero UID here -
+      // dropping these atoms would silently lose all chapter data.
+      auto chapter = parseChapterAtom(element);
+      if(chapter.uid() || chapter.timeStart() != 0 ||
+         !chapter.displayList().isEmpty()) {
         orphanChapters.append(chapter);
       }
       continue;
@@ -124,7 +130,12 @@ std::unique_ptr<Matroska::Chapters> EBML::MkChapters::parse() const
       else if(id == Id::MkEditionFlagOrdered)
         editionIsOrdered = element_cast<Id::MkEditionFlagOrdered>(editionChild)->getValue() != 0;
       else if(id == Id::MkChapterAtom) {
-        if(auto chapter = parseChapterAtom(editionChild); chapter.uid()) {
+        // Do not require a non-zero ChapterUID. Some non-conforming muxers
+        // omit it; rejecting such atoms would silently drop every chapter
+        // in the edition. Keep any atom that carries usable data.
+        auto chapter = parseChapterAtom(editionChild);
+        if(chapter.uid() || chapter.timeStart() != 0 ||
+           !chapter.displayList().isEmpty()) {
           editionChapters.append(chapter);
         }
       }
