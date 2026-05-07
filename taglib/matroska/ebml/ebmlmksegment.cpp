@@ -54,6 +54,25 @@ std::unique_ptr<ElementType> readElementAt(File &file,
   return typed;
 }
 
+// Specialised read-at for MkAttachments that skips the binary data of
+// every MkAttachedFileData child.  See MkAttachments::readMetadataOnly().
+std::unique_ptr<EBML::MkAttachments> readAttachmentsMetadataAt(
+    File &file, offset_t offset, offset_t maxOffset)
+{
+  if(offset < 0 || offset >= maxOffset)
+    return nullptr;
+
+  file.seek(offset);
+  auto element = EBML::Element::factory(file);
+  if(!element || element->getId() != EBML::Element::Id::MkAttachments)
+    return nullptr;
+
+  auto typed = EBML::element_cast<EBML::Element::Id::MkAttachments>(std::move(element));
+  if(!typed || !typed->readMetadataOnly(file))
+    return nullptr;
+  return typed;
+}
+
 } // namespace
 
 EBML::MkSegment::MkSegment(int sizeLength, offset_t dataSize, offset_t offset):
@@ -83,6 +102,13 @@ bool EBML::MkSegment::readLimited(File &file, offset_t scanLimit)
   const offset_t filePos = file.tell();
   const offset_t maxOffset = filePos + dataSize;
   const offset_t maxScanOffset = filePos + std::min(scanLimit, dataSize);
+  // When scanLimit is less than dataSize, the caller has requested a
+  // fast/limited scan (e.g. AudioProperties::Fast).  In that case we skip
+  // parsing the Cues element, which is only needed for Accurate validation
+  // and can be tens of MB on large files, causing severe slowdowns over
+  // network filesystems.  We also skip the binary data of attachments
+  // (cover art, fonts), which is rarely needed during a fast metadata read.
+  const bool isFastScan = scanLimit < dataSize;
   MasterElement *pendingPaddingTarget = nullptr;
   offset_t accumulatedPadding = 0;
   std::unique_ptr<Element> element;
@@ -112,9 +138,12 @@ bool EBML::MkSegment::readLimited(File &file, offset_t scanLimit)
         const offset_t absoluteOffset = segDataOffset + relativeOffset;
         switch(static_cast<Id>(idValue)) {
         case Id::MkCues:
-          if(!((cues = readElementAt<Id::MkCues, MkCues>(
-            file, absoluteOffset, maxOffset))))
-            return false;
+          // Skip Cues in fast scan mode; they are only used for Accurate validation.
+          if(!isFastScan) {
+            if(!((cues = readElementAt<Id::MkCues, MkCues>(
+              file, absoluteOffset, maxOffset))))
+              return false;
+          }
           break;
         case Id::MkInfo:
           if(!((info = readElementAt<Id::MkInfo, MkInfo>(
@@ -133,9 +162,16 @@ bool EBML::MkSegment::readLimited(File &file, offset_t scanLimit)
           accumulateVoidPadding(tags.get());
           break;
         case Id::MkAttachments:
-          if(!((attachments = readElementAt<Id::MkAttachments, MkAttachments>(
-            file, absoluteOffset, maxOffset))))
-            return false;
+          if(isFastScan) {
+            if(!((attachments = readAttachmentsMetadataAt(
+              file, absoluteOffset, maxOffset))))
+              return false;
+          }
+          else {
+            if(!((attachments = readElementAt<Id::MkAttachments, MkAttachments>(
+              file, absoluteOffset, maxOffset))))
+              return false;
+          }
           accumulateVoidPadding(attachments.get());
           break;
         case Id::MkChapters:
@@ -160,9 +196,15 @@ bool EBML::MkSegment::readLimited(File &file, offset_t scanLimit)
     else if(id == Id::MkCues) {
       pendingPaddingTarget = nullptr;
       accumulatedPadding = 0;
-      cues = element_cast<Id::MkCues>(std::move(element));
-      if(!cues->read(file))
-        return false;
+      // Skip Cues in fast scan mode; they are only used for Accurate validation.
+      if(isFastScan) {
+        element->skipData(file);
+      }
+      else {
+        cues = element_cast<Id::MkCues>(std::move(element));
+        if(!cues->read(file))
+          return false;
+      }
     }
     else if(id == Id::MkInfo) {
       pendingPaddingTarget = nullptr;
@@ -190,7 +232,10 @@ bool EBML::MkSegment::readLimited(File &file, offset_t scanLimit)
       pendingPaddingTarget = nullptr;
       accumulatedPadding = 0;
       attachments = element_cast<Id::MkAttachments>(std::move(element));
-      if(!attachments->read(file))
+      const bool ok = isFastScan
+        ? attachments->readMetadataOnly(file)
+        : attachments->read(file);
+      if(!ok)
         return false;
       pendingPaddingTarget = attachments.get();
     }
